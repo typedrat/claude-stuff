@@ -1,0 +1,17 @@
+{
+  "name": "typedrat",
+  "owner": {
+    "name": "typedrat"
+  },
+  "metadata": {
+    "description": "Collection of Claude Code plugins for enhanced functionality",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "openrouter-image-gen",
+      "source": "./plugins/openrouter-image-gen",
+      "description": "Generate images using OpenRouter's API with models like Gemini and FLUX"
+    }
+  ]
+}
