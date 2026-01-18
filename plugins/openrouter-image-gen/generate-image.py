@@ -422,7 +422,7 @@ def generate_image(
         sys.exit(1)
 
     # Create output directory
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Generate base filename if not provided
     if output_file:

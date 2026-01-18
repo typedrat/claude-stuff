@@ -1,7 +1,7 @@
 {
   "name": "openrouter-image-gen",
   "description": "Generate images using OpenRouter's API with models like Gemini and FLUX",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": {
     "name": "typedrat"
   },
