@@ -10,7 +10,10 @@ Uses the chat completions endpoint with image modalities.
 
 import argparse
 import base64
+import json
+import mimetypes
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,8 +33,10 @@ CONFIG_LOCATIONS = [
     Path.home() / ".openrouter-config",
 ]
 
-# Output directory is current working directory
-OUTPUT_DIR = Path.cwd() / "generated-images"
+# Use XDG state directory for all generated content
+XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+OUTPUT_DIR = XDG_STATE_HOME / "openrouter-image-gen" / "output"
+SESSIONS_DIR = XDG_STATE_HOME / "openrouter-image-gen" / "sessions"
 
 ASPECT_RATIOS = {
     "1:1": "1024×1024",
@@ -93,6 +98,101 @@ def load_api_key() -> str:
         sys.exit(1)
 
     return api_key
+
+
+def upload_to_litterbox(image_path: Path, expiry: str = "1h") -> str:
+    """Upload an image to Litterbox temporary hosting and return the URL."""
+    with open(image_path, "rb") as f:
+        response = requests.post(
+            "https://litterbox.catbox.moe/resources/internals/api.php",
+            data={"reqtype": "fileupload", "time": expiry},
+            files={"fileToUpload": (image_path.name, f)},
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.text.strip()
+
+
+# Session management functions
+def get_session_dir(name: str) -> Path:
+    """Get the directory path for a named session."""
+    return SESSIONS_DIR / name
+
+
+def load_session(name: str) -> dict | None:
+    """Load session state from disk. Returns None if session doesn't exist."""
+    session_dir = get_session_dir(name)
+    session_file = session_dir / "session.json"
+    if not session_file.exists():
+        return None
+    return json.loads(session_file.read_text())
+
+
+def save_session(name: str, data: dict) -> None:
+    """Save session state to disk."""
+    session_dir = get_session_dir(name)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_file = session_dir / "session.json"
+    session_file.write_text(json.dumps(data, indent=2))
+
+
+def get_latest_session() -> str | None:
+    """Find the most recently modified session. Returns session name or None."""
+    if not SESSIONS_DIR.exists():
+        return None
+    sessions = [d for d in SESSIONS_DIR.iterdir() if d.is_dir() and (d / "session.json").exists()]
+    if not sessions:
+        return None
+    # Sort by modification time of session.json
+    sessions.sort(key=lambda d: (d / "session.json").stat().st_mtime, reverse=True)
+    return sessions[0].name
+
+
+def list_sessions() -> None:
+    """Display all available sessions."""
+    if not SESSIONS_DIR.exists():
+        console.print("[yellow]No sessions found.[/yellow]")
+        return
+
+    sessions = [d for d in SESSIONS_DIR.iterdir() if d.is_dir() and (d / "session.json").exists()]
+    if not sessions:
+        console.print("[yellow]No sessions found.[/yellow]")
+        return
+
+    # Sort by modification time
+    sessions.sort(key=lambda d: (d / "session.json").stat().st_mtime, reverse=True)
+
+    table = Table(title="Image Generation Sessions")
+    table.add_column("Session", style="cyan")
+    table.add_column("Model", style="dim")
+    table.add_column("Messages", justify="right")
+    table.add_column("Images", justify="right")
+    table.add_column("Last Modified", style="dim")
+
+    for session_dir in sessions:
+        data = load_session(session_dir.name)
+        if data:
+            msg_count = len(data.get("messages", []))
+            img_count = len(list(session_dir.glob("*.png"))) + len(list(session_dir.glob("*.jpg")))
+            mtime = datetime.fromtimestamp((session_dir / "session.json").stat().st_mtime)
+            table.add_row(
+                session_dir.name,
+                data.get("model", "unknown"),
+                str(msg_count),
+                str(img_count),
+                mtime.strftime("%Y-%m-%d %H:%M"),
+            )
+
+    console.print(table)
+
+
+def delete_session(name: str) -> bool:
+    """Delete a session and all its files. Returns True if successful."""
+    session_dir = get_session_dir(name)
+    if not session_dir.exists():
+        return False
+    shutil.rmtree(session_dir)
+    return True
 
 
 def list_image_models() -> None:
@@ -171,9 +271,27 @@ def generate_image(
     aspect_ratio: str | None = None,
     image_size: str | None = None,
     output_file: str | None = None,
+    reference_images: list[Path] | None = None,
+    session_name: str | None = None,
 ) -> list[Path]:
     """Generate images using OpenRouter's chat completions API."""
     api_key = load_api_key()
+
+    # Load existing session if continuing
+    session_data: dict | None = None
+    messages: list[dict] = []
+    if session_name:
+        session_data = load_session(session_name)
+        if session_data:
+            messages = session_data.get("messages", [])
+            # Use session's model/config if not explicitly overridden
+            if model == DEFAULT_MODEL and session_data.get("model"):
+                model = session_data["model"]
+            if aspect_ratio is None and session_data.get("aspect_ratio"):
+                aspect_ratio = session_data["aspect_ratio"]
+            if image_size is None and session_data.get("image_size"):
+                image_size = session_data["image_size"]
+            console.print(f"[dim]Continuing session: {session_name} ({len(messages)} previous messages)[/dim]")
 
     console.print(f"[bold]Prompt:[/bold] {prompt}")
     console.print(f"[dim]Model: {model}[/dim]")
@@ -183,17 +301,63 @@ def generate_image(
         )
     if image_size:
         console.print(f"[dim]Image size: {image_size}[/dim]")
+
+    # Upload reference images if provided
+    reference_urls: list[str] = []
+    if reference_images:
+        console.print(f"[dim]Reference images: {len(reference_images)}[/dim]")
+        with console.status("[bold blue]Uploading reference images...[/bold blue]"):
+            for img_path in reference_images:
+                if not img_path.exists():
+                    console.print(f"[yellow]Warning:[/yellow] Reference image not found: {img_path}")
+                    continue
+                try:
+                    url = upload_to_litterbox(img_path)
+                    reference_urls.append(url)
+                    console.print(f"[dim]  Uploaded: {img_path.name}[/dim]")
+                except Exception as e:
+                    console.print(f"[yellow]Warning:[/yellow] Failed to upload {img_path.name}: {e}")
+
+    # For continuing sessions, upload previous generated images so model can see them
+    if session_name and session_data and not reference_urls:
+        session_dir = get_session_dir(session_name)
+        prev_images = sorted(session_dir.glob("*.png")) + sorted(session_dir.glob("*.jpg"))
+        if prev_images:
+            # Upload the most recent image(s) for context
+            latest_image = prev_images[-1]
+            console.print(f"[dim]Including previous image: {latest_image.name}[/dim]")
+            with console.status("[bold blue]Uploading previous image for context...[/bold blue]"):
+                try:
+                    url = upload_to_litterbox(latest_image)
+                    reference_urls.append(url)
+                except Exception as e:
+                    console.print(f"[yellow]Warning:[/yellow] Failed to upload previous image: {e}")
+
     console.print()
+
+    # Build message content - multimodal if we have reference images
+    if reference_urls:
+        content: list[dict] | str = []
+        for url in reference_urls:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": url},
+            })
+        content.append({
+            "type": "text",
+            "text": prompt,
+        })
+    else:
+        content = prompt
+
+    # Add new user message to history
+    new_user_message = {"role": "user", "content": content}
+    messages.append(new_user_message)
 
     # Build request payload
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+        "messages": messages,
         "modalities": ["image", "text"],
     }
 
@@ -245,10 +409,10 @@ def generate_image(
     message = choices[0].get("message", {})
     images = message.get("images", [])
 
-    # Also print any text content
+    # Also print any text content from the model
     text_content = message.get("content")
     if text_content:
-        console.print(f"[dim]{text_content}[/dim]\n")
+        console.print(Panel(text_content, title="[cyan]Model Response[/cyan]", border_style="cyan"))
 
     if not images:
         console.print("[red]Error:[/red] No images in response")
@@ -270,6 +434,7 @@ def generate_image(
         extension = ".png"
 
     saved_files: list[Path] = []
+    session_image_files: list[str] = []  # Track image filenames for session
 
     for i, image_data in enumerate(images):
         # Determine filename
@@ -295,6 +460,7 @@ def generate_image(
                 image_bytes = base64.b64decode(b64_data)
                 file_path.write_bytes(image_bytes)
                 saved_files.append(file_path)
+                session_image_files.append(filename)
             except Exception as e:
                 console.print(
                     f"[yellow]Warning:[/yellow] Failed to decode image {i + 1}: {e}"
@@ -306,10 +472,56 @@ def generate_image(
                 img_response.raise_for_status()
                 file_path.write_bytes(img_response.content)
                 saved_files.append(file_path)
+                session_image_files.append(filename)
             except Exception as e:
                 console.print(
                     f"[yellow]Warning:[/yellow] Failed to download image {i + 1}: {e}"
                 )
+
+    # Save session state if using sessions
+    if session_name:
+        # Build assistant message with images as proper content parts
+        assistant_content: list[dict] | str
+        if images:
+            assistant_content = []
+            # Include any text response
+            if text_content:
+                assistant_content.append({"type": "text", "text": text_content})
+            # Include generated images with their base64 data URLs
+            for image_data in images:
+                image_url = image_data.get("image_url", {}).get("url", "")
+                if image_url:
+                    assistant_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    })
+        else:
+            assistant_content = text_content or ""
+
+        assistant_message = {
+            "role": "assistant",
+            "content": assistant_content,
+        }
+        messages.append(assistant_message)
+
+        # Save session
+        session_data = {
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
+            "messages": messages,
+            "created": session_data.get("created") if session_data else datetime.now().isoformat(),
+            "updated": datetime.now().isoformat(),
+        }
+        save_session(session_name, session_data)
+
+        # Copy images to session folder
+        session_dir = get_session_dir(session_name)
+        for file_path in saved_files:
+            dest = session_dir / file_path.name
+            shutil.copy2(file_path, dest)
+
+        console.print(f"[dim]Session saved: {session_name}[/dim]")
 
     return saved_files
 
@@ -366,15 +578,66 @@ Examples:
         default=DEFAULT_MODEL,
         help=f"Model to use (default: {DEFAULT_MODEL})",
     )
+    parser.add_argument(
+        "-r",
+        "--reference",
+        action="append",
+        type=Path,
+        dest="reference_images",
+        metavar="IMAGE",
+        help="Reference image(s) for style/content guidance (can be used multiple times)",
+    )
+
+    # Session management arguments
+    parser.add_argument(
+        "--session",
+        metavar="NAME",
+        help="Create or continue a named session for iterative refinement",
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_latest",
+        action="store_true",
+        help="Continue the most recent session",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List all available sessions",
+    )
+    parser.add_argument(
+        "--delete-session",
+        metavar="NAME",
+        help="Delete a session and all its files",
+    )
 
     args = parser.parse_args()
+
+    if args.list_sessions:
+        list_sessions()
+        return
+
+    if args.delete_session:
+        if delete_session(args.delete_session):
+            console.print(f"[green]Deleted session:[/green] {args.delete_session}")
+        else:
+            console.print(f"[red]Session not found:[/red] {args.delete_session}")
+        return
 
     if args.list_models:
         list_image_models()
         return
 
     if not args.prompt:
-        parser.error("prompt is required unless using --list-models")
+        parser.error("prompt is required unless using --list-models or --list-sessions")
+
+    # Determine session name
+    session_name = args.session
+    if args.continue_latest:
+        session_name = get_latest_session()
+        if not session_name:
+            console.print("[red]Error:[/red] No previous session to continue")
+            sys.exit(1)
 
     saved_files = generate_image(
         prompt=args.prompt,
@@ -382,6 +645,8 @@ Examples:
         aspect_ratio=args.aspect_ratio,
         image_size=args.size,
         output_file=args.output,
+        reference_images=args.reference_images,
+        session_name=session_name,
     )
 
     if saved_files:
